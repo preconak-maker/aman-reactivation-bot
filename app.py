@@ -91,6 +91,13 @@ def scheduler_loop():
         time.sleep(60 * 30)
 
 
+def send_delayed_reply(to_number: str, ai_reply: str, delay_seconds: int):
+    from sms_sender import send_sms
+    print(f"[TYPING DELAY] Waiting {delay_seconds}s to simulate human typing...")
+    time.sleep(delay_seconds)
+    send_sms(to_number, ai_reply)
+
+
 @app.route("/webhook/sms", methods=["POST"])
 def sms_webhook():
     from lead_tracker import update_lead_reply, update_lead_optout
@@ -114,13 +121,16 @@ def sms_webhook():
     update_lead_reply(from_number, incoming_msg, temperature)
     ai_reply = generate_ai_reply(conversations[from_number], incoming_msg)
 
-    # Human-like typing delay — 20-45 seconds based on reply length
     words = len(ai_reply.split())
     typing_delay = random.randint(20, 45) + (words // 5)
-    print(f"[TYPING DELAY] Waiting {typing_delay}s to simulate human typing...")
-    time.sleep(typing_delay)
 
-    resp.message(ai_reply)
+    reply_thread = threading.Thread(
+        target=send_delayed_reply,
+        args=(from_number, ai_reply, typing_delay)
+    )
+    reply_thread.daemon = True
+    reply_thread.start()
+
     return str(resp)
 
 
