@@ -169,7 +169,7 @@ def login_required(f):
 @app.route("/")
 def root():
     """Blank root — hides the fact that a dashboard exists."""
-    return "", 404
+    return "<html><body></body></html>", 200
 
 
 @app.route(f"/{SECRET_PATH}/")
