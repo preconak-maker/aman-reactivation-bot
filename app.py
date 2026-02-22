@@ -506,10 +506,3 @@ scheduler_thread = threading.Thread(target=scheduler_loop)
 scheduler_thread.daemon = True
 scheduler_thread.start()
 print("[AGENT] Background scheduler started")
-```
-
----
-
-Commit it → Railway redeploys automatically → then visit:
-```
-https://aman-reactivation-bot-production.up.railway.app
