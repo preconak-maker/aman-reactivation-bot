@@ -113,6 +113,13 @@ def sms_webhook():
     temperature = classify_lead_temperature(incoming_msg)
     update_lead_reply(from_number, incoming_msg, temperature)
     ai_reply = generate_ai_reply(conversations[from_number], incoming_msg)
+
+    # Human-like typing delay — 20-45 seconds based on reply length
+    words = len(ai_reply.split())
+    typing_delay = random.randint(20, 45) + (words // 5)
+    print(f"[TYPING DELAY] Waiting {typing_delay}s to simulate human typing...")
+    time.sleep(typing_delay)
+
     resp.message(ai_reply)
     return str(resp)
 
