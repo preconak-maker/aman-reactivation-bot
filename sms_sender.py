@@ -30,8 +30,10 @@ def send_sms(to_number: str, message: str) -> bool:
         return False
 
 
-def generate_ai_reply(conversation_history: list, incoming_message: str) -> str:
+def generate_ai_reply(conversation_history: list, incoming_message: str, system_prompt: str = None) -> str:
     client = get_claude_client()
+    if not system_prompt:
+        system_prompt = SYSTEM_PROMPT
     conversation_history.append({
         "role": "user",
         "content": incoming_message
@@ -39,7 +41,7 @@ def generate_ai_reply(conversation_history: list, incoming_message: str) -> str:
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=200,
-        system=SYSTEM_PROMPT,
+        system=system_prompt,
         messages=conversation_history
     )
     reply = response.content[0].text.strip()
