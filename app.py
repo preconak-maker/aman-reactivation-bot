@@ -1,6 +1,6 @@
 """
 Aman's Team — Reactivation SMS Agent
-Flask app with scheduler + Twilio webhook + Dashboard + Broadcast
+Flask app with scheduler + Twilio webhook + Dashboard + Broadcast + Add Lead
 """
 
 from flask import Flask, request, jsonify, render_template_string, session, redirect
@@ -209,6 +209,65 @@ def api_leads():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/add_lead", methods=["POST"])
+@login_required
+def api_add_lead():
+    from lead_tracker import load_leads, LEADS_FILE, SHEET_NAME
+    from openpyxl import load_workbook
+    data = request.json or {}
+
+    def fmt(p):
+        if not p: return ""
+        n = str(p).strip().replace("-","").replace("(","").replace(")","").replace(" ","").replace("+","")
+        if len(n)==10: return f"+1{n}"
+        elif len(n)==11 and n.startswith("1"): return f"+{n}"
+        return f"+{n}"
+
+    first_name = str(data.get("first_name","")).strip()
+    phone      = fmt(data.get("phone",""))
+
+    if not first_name:
+        return jsonify({"error": "First name is required"}), 400
+    if not phone:
+        return jsonify({"error": "Phone number is required"}), 400
+
+    try:
+        existing_df = load_leads()
+        if phone in existing_df["Phone (Formatted)"].astype(str).str.strip().values:
+            return jsonify({"error": "This phone number already exists in your leads"}), 400
+
+        wb   = load_workbook(LEADS_FILE)
+        ws   = wb[SHEET_NAME]
+        hdrs = [cell.value for cell in ws[1]]
+
+        row = {
+            "First Name":         first_name,
+            "Last Name":          str(data.get("last_name","")),
+            "Phone (Formatted)":  phone,
+            "Email":              str(data.get("email","")),
+            "Buyer/Seller":       str(data.get("buyer_seller","Buyer")),
+            "Favorite City":      str(data.get("city","")),
+            "Notes":              str(data.get("notes","")),
+            "Phase":              str(data.get("phase","Phase 1")),
+            "Source":             "Manual",
+            "SMS Status":         "Pending",
+            "SMS Sent At":        "",
+            "SMS Message Sent":   "",
+            "Reply Received":     "No",
+            "Reply Text":         "",
+            "Lead Temperature":   "",
+            "Follow Up Required": "",
+            "Agent Notes":        ""
+        }
+
+        ws.append([row.get(h,"") for h in hdrs])
+        wb.save(LEADS_FILE)
+        return jsonify({"success": True, "message": f"{first_name} added successfully!"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/conversation/<path:phone>")
 @login_required
 def api_conversation(phone):
@@ -271,7 +330,6 @@ def api_broadcast_send():
         if df.empty:
             return jsonify({"error": "No leads match your filters"}), 400
 
-        # Build personalized messages
         send_list = []
         for _, lead in df.iterrows():
             phone      = str(lead.get("Phone (Formatted)","")).strip()
@@ -281,8 +339,6 @@ def api_broadcast_send():
                 personalized = get_broadcast_message(first_name, message, phase)
                 send_list.append((phone, personalized))
 
-        # Send in background
-        phones   = [p for p, _ in send_list]
         messages = {p: m for p, m in send_list}
 
         def send_all():
@@ -309,23 +365,18 @@ def apply_broadcast_filters(df, filters):
         phases = filters["phase"] if isinstance(filters["phase"], list) else [filters["phase"]]
         if "Phase" in df.columns:
             df = df[df["Phase"].isin(phases)]
-
     if filters.get("buyer_seller"):
         types = filters["buyer_seller"] if isinstance(filters["buyer_seller"], list) else [filters["buyer_seller"]]
         df = df[df["Buyer/Seller"].isin(types)]
-
     if filters.get("city") and filters["city"].strip():
         df = df[df["Favorite City"].astype(str).str.lower().str.contains(filters["city"].lower())]
-
     if filters.get("temperature"):
         temps = filters["temperature"] if isinstance(filters["temperature"], list) else [filters["temperature"]]
         df = df[df["Lead Temperature"].isin(temps)]
-
     if filters.get("status") == "pending":
         df = df[df["SMS Status"] == "Pending"]
     elif filters.get("status") == "contacted":
         df = df[df["SMS Status"] == "Sent"]
-
     return df
 
 
@@ -419,7 +470,7 @@ def api_zapier():
             "Buyer/Seller":str(data.get("buyer_seller","Buyer")),
             "Favorite City":str(data.get("city","")),
             "Notes":str(data.get("notes") or data.get("ad_notes","")),
-            "Phase":"Phase 1",
+            "Phase":"Phase 1","Source":"Zapier",
             "SMS Status":"Pending","SMS Sent At":"","SMS Message Sent":"",
             "Reply Received":"No","Reply Text":"","Lead Temperature":"",
             "Follow Up Required":"","Agent Notes":""}
@@ -450,7 +501,6 @@ def sms_webhook():
     if from_number not in conversations:
         conversations[from_number] = []
 
-    # Get phase for this lead
     try:
         df    = load_leads()
         df["Phone (Formatted)"] = df["Phone (Formatted)"].astype(str).str.strip()
@@ -459,12 +509,12 @@ def sms_webhook():
     except:
         phase = "Phase 1"
 
-    temperature  = classify_lead_temperature(incoming_msg)
+    temperature   = classify_lead_temperature(incoming_msg)
     update_lead_reply(from_number, incoming_msg, temperature)
     system_prompt = get_system_prompt(phase)
-    ai_reply     = generate_ai_reply(conversations[from_number], incoming_msg, system_prompt)
-    words        = len(ai_reply.split())
-    typing_delay = random.randint(20,45) + (words//5)
+    ai_reply      = generate_ai_reply(conversations[from_number], incoming_msg, system_prompt)
+    words         = len(ai_reply.split())
+    typing_delay  = random.randint(20,45) + (words//5)
 
     t = threading.Thread(target=send_delayed_reply, args=(from_number, ai_reply, typing_delay))
     t.daemon = True
@@ -501,14 +551,14 @@ DASHBOARD_HTML = """<!DOCTYPE html><html><head><title>Aman's Agent</title>
 body{background:#0f172a;color:#e2e8f0;font-family:Arial,sans-serif}
 .header{background:#1e293b;padding:16px 24px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155}
 .header h1{font-size:18px;color:#fff}
-.btn{padding:8px 16px;border-radius:8px;border:none;cursor:pointer;font-size:13px;font-weight:bold}
-.btn-blue{background:#3b82f6;color:#fff}.btn-blue:hover{background:#2563eb}
-.btn-green{background:#22c55e;color:#fff}.btn-green:hover{background:#16a34a}
-.btn-yellow{background:#f59e0b;color:#fff}.btn-yellow:hover{background:#d97706}
-.btn-gray{background:#475569;color:#fff}.btn-gray:hover{background:#334155}
-.btn-purple{background:#8b5cf6;color:#fff}.btn-purple:hover{background:#7c3aed}
-.btn-red{background:#ef4444;color:#fff}.btn-red:hover{background:#dc2626}
-.btn-sm{padding:5px 10px;font-size:12px}
+.btn{padding:8px 16px;border-radius:8px;border:none;cursor:pointer;font-size:13px;font-weight:bold;transition:opacity .2s}
+.btn:hover{opacity:.85}
+.btn-blue{background:#3b82f6;color:#fff}
+.btn-green{background:#22c55e;color:#fff}
+.btn-yellow{background:#f59e0b;color:#fff}
+.btn-gray{background:#475569;color:#fff}
+.btn-purple{background:#8b5cf6;color:#fff}
+.btn-teal{background:#0d9488;color:#fff}
 .header-right{display:flex;gap:10px;align-items:center}
 .stats{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;padding:20px 24px}
 .stat-card{background:#1e293b;border-radius:10px;padding:16px;text-align:center;border:1px solid #334155}
@@ -565,11 +615,82 @@ tr:hover td{background:#263548}tr.selected td{background:#1d3a5e}
 .toast.error{background:#ef4444}
 .status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
 .dot-green{background:#22c55e}.dot-red{background:#ef4444}.dot-yellow{background:#f59e0b}
+.modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:#1e293b;border-radius:12px;padding:28px;width:480px;border:1px solid #334155;max-height:90vh;overflow-y:auto}
+.modal h3{font-size:16px;font-weight:bold;margin-bottom:20px;color:#fff}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.form-group{margin-bottom:12px}
+.form-group label{display:block;font-size:12px;color:#94a3b8;margin-bottom:6px;font-weight:bold;text-transform:uppercase}
+.form-group input,.form-group select,.form-group textarea{width:100%;padding:10px 12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#fff;font-size:13px}
+.form-group textarea{resize:none;height:60px}
+.modal-actions{display:flex;gap:10px;margin-top:20px}
+.form-group select option{background:#1e293b}
 </style></head>
 <body>
+
+<!-- ADD LEAD MODAL -->
+<div class="modal-overlay" id="add-lead-modal">
+  <div class="modal">
+    <h3>➕ Add New Lead</h3>
+    <div class="form-row">
+      <div class="form-group">
+        <label>First Name *</label>
+        <input id="al-firstname" placeholder="John">
+      </div>
+      <div class="form-group">
+        <label>Last Name</label>
+        <input id="al-lastname" placeholder="Smith">
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Phone Number *</label>
+        <input id="al-phone" placeholder="647-123-4567">
+      </div>
+      <div class="form-group">
+        <label>Email</label>
+        <input id="al-email" placeholder="john@email.com">
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Buyer / Seller</label>
+        <select id="al-type">
+          <option value="Buyer">Buyer</option>
+          <option value="Seller">Seller</option>
+          <option value="Both">Both</option>
+          <option value="Neither">Neither</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Phase</label>
+        <select id="al-phase">
+          <option value="Phase 1">Phase 1 — Recent (0-2 yrs)</option>
+          <option value="Phase 2">Phase 2 — Warm (2-5 yrs)</option>
+          <option value="Phase 3">Phase 3 — Cold (5+ yrs)</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>City</label>
+      <input id="al-city" placeholder="Brampton, Mississauga...">
+    </div>
+    <div class="form-group">
+      <label>Notes</label>
+      <textarea id="al-notes" placeholder="Any notes about this lead..."></textarea>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-gray" onclick="closeAddLead()" style="flex:1;">Cancel</button>
+      <button class="btn btn-teal" onclick="submitAddLead()" style="flex:2;">➕ Add Lead</button>
+    </div>
+  </div>
+</div>
+
 <div class="header">
   <div><h1>🏠 Aman's Reactivation Agent</h1><span id="agent-status"><span class="status-dot dot-yellow"></span>Loading...</span></div>
   <div class="header-right">
+    <button class="btn btn-teal" onclick="openAddLead()">➕ Add Lead</button>
     <button class="btn btn-green" onclick="triggerCampaign()">🚀 Launch Campaign</button>
     <button class="btn btn-yellow" id="pause-btn" onclick="togglePause()">⏸ Pause</button>
     <button class="btn btn-gray" onclick="location='/logout'">Logout</button>
@@ -626,12 +747,10 @@ tr:hover td{background:#263548}tr.selected td{background:#1d3a5e}
     <div class="panel">
       <div class="panel-header"><h3>📢 Broadcast Message</h3><span style="font-size:12px;color:#94a3b8;">Send a property or announcement to selected leads</span></div>
       <div class="broadcast-box">
-
         <div class="filter-group">
           <label>Your Message</label>
           <textarea id="broadcast-msg" placeholder="e.g. We just listed a stunning 4-bed detached in Brampton for $899k — perfect for families. Would you like to see it? Reply YES and I'll send you the details!"></textarea>
         </div>
-
         <div class="filter-group">
           <label>Phase</label>
           <div class="checkbox-group">
@@ -640,7 +759,6 @@ tr:hover td{background:#263548}tr.selected td{background:#1d3a5e}
             <label class="checkbox-item"><input type="checkbox" class="bc-phase" value="Phase 3"> Phase 3 (5+ yrs)</label>
           </div>
         </div>
-
         <div class="filter-group">
           <label>Buyer / Seller Type</label>
           <div class="checkbox-group">
@@ -650,7 +768,6 @@ tr:hover td{background:#263548}tr.selected td{background:#1d3a5e}
             <label class="checkbox-item"><input type="checkbox" class="bc-type" value="Neither"> Neither</label>
           </div>
         </div>
-
         <div class="filter-group">
           <label>Lead Temperature</label>
           <div class="checkbox-group">
@@ -660,21 +777,15 @@ tr:hover td{background:#263548}tr.selected td{background:#1d3a5e}
             <label class="checkbox-item"><input type="checkbox" class="bc-temp" value=""> Not yet rated</label>
           </div>
         </div>
-
         <div class="filter-group">
           <label>Filter by City (optional)</label>
           <input class="city-input" id="bc-city" placeholder="e.g. Brampton, Mississauga...">
         </div>
-
-        <div class="preview-box" id="broadcast-preview">
-          Click "Preview" to see how many leads will receive this message.
-        </div>
-
+        <div class="preview-box" id="broadcast-preview">Click "Preview" to see how many leads will receive this message.</div>
         <div style="display:flex;gap:10px;">
           <button class="btn btn-gray" onclick="previewBroadcast()" style="flex:1;">👁️ Preview Count</button>
           <button class="btn btn-purple" onclick="sendBroadcast()" style="flex:2;">📢 Send Broadcast</button>
         </div>
-
       </div>
     </div>
   </div>
@@ -701,11 +812,37 @@ tr:hover td{background:#263548}tr.selected td{background:#1d3a5e}
 <script>
 let currentFilter='all',currentPhone=null,searchTimer=null;
 
-function switchTab(tab, el) {
+function switchTab(tab,el){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
   el.classList.add('active');
   document.getElementById('tab-'+tab).classList.add('active');
+}
+
+function openAddLead(){document.getElementById('add-lead-modal').classList.add('open');}
+function closeAddLead(){document.getElementById('add-lead-modal').classList.remove('open');clearAddForm();}
+function clearAddForm(){
+  ['al-firstname','al-lastname','al-phone','al-email','al-city','al-notes'].forEach(id=>document.getElementById(id).value='');
+  document.getElementById('al-type').value='Buyer';
+  document.getElementById('al-phase').value='Phase 1';
+}
+
+async function submitAddLead(){
+  const first_name=document.getElementById('al-firstname').value.trim();
+  const phone=document.getElementById('al-phone').value.trim();
+  if(!first_name||!phone){showToast('First name and phone are required',true);return;}
+  const d=await(await fetch('/api/add_lead',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    first_name,
+    last_name:document.getElementById('al-lastname').value.trim(),
+    phone,
+    email:document.getElementById('al-email').value.trim(),
+    buyer_seller:document.getElementById('al-type').value,
+    phase:document.getElementById('al-phase').value,
+    city:document.getElementById('al-city').value.trim(),
+    notes:document.getElementById('al-notes').value.trim()
+  })})).json();
+  if(d.error){showToast(d.error,true);}
+  else{showToast('✅ '+d.message);closeAddLead();loadStats();loadLeads();}
 }
 
 async function loadStats(){
@@ -760,28 +897,26 @@ async function sendManualReply(){
 }
 
 function getBroadcastFilters(){
-  return {
-    phase:        [...document.querySelectorAll('.bc-phase:checked')].map(e=>e.value),
-    buyer_seller: [...document.querySelectorAll('.bc-type:checked')].map(e=>e.value),
-    temperature:  [...document.querySelectorAll('.bc-temp:checked')].map(e=>e.value),
-    city:         document.getElementById('bc-city').value.trim()
+  return{
+    phase:[...document.querySelectorAll('.bc-phase:checked')].map(e=>e.value),
+    buyer_seller:[...document.querySelectorAll('.bc-type:checked')].map(e=>e.value),
+    temperature:[...document.querySelectorAll('.bc-temp:checked')].map(e=>e.value),
+    city:document.getElementById('bc-city').value.trim()
   };
 }
 
 async function previewBroadcast(){
-  const filters=getBroadcastFilters();
-  const d=await(await fetch('/api/broadcast/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(filters)})).json();
+  const d=await(await fetch('/api/broadcast/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(getBroadcastFilters())})).json();
   if(d.error){showToast(d.error,true);return;}
-  document.getElementById('broadcast-preview').innerHTML=`<strong>${d.count} leads</strong> will receive this message.<br><small style="color:#64748b;">Sample: ${d.sample.join(', ')}</small>`;
+  document.getElementById('broadcast-preview').innerHTML=`<strong>${d.count} leads</strong> will receive this message.<br><small style="color:#64748b;">Sample names: ${d.sample.join(', ')}</small>`;
 }
 
 async function sendBroadcast(){
   const msg=document.getElementById('broadcast-msg').value.trim();
   if(!msg){showToast('Please write a message first',true);return;}
-  const filters=getBroadcastFilters();
-  if(!confirm(`Send broadcast to selected leads?`))return;
-  const d=await(await fetch('/api/broadcast/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,filters})})).json();
-  d.error?showToast(d.error,true):showToast(`📢 ${d.message}`);
+  if(!confirm('Send broadcast to selected leads?'))return;
+  const d=await(await fetch('/api/broadcast/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,filters:getBroadcastFilters()})})).json();
+  d.error?showToast(d.error,true):showToast('📢 '+d.message);
 }
 
 async function triggerCampaign(){
@@ -805,11 +940,20 @@ async function uploadLeads(input){
   const fd=new FormData();fd.append('file',file);
   showToast('Uploading...');
   const d=await(await fetch('/api/upload',{method:'POST',body:fd})).json();
-  d.error?showToast(d.error,true):showToast(`✅ ${d.message}`);
+  d.error?showToast(d.error,true):showToast('✅ '+d.message);
   loadStats();loadLeads();input.value='';
 }
 
-function showToast(msg,err=false){const t=document.getElementById('toast');t.textContent=msg;t.className='toast'+(err?' error':'');t.style.display='block';setTimeout(()=>t.style.display='none',4000);}
+function showToast(msg,err=false){
+  const t=document.getElementById('toast');
+  t.textContent=msg;t.className='toast'+(err?' error':'');
+  t.style.display='block';
+  setTimeout(()=>t.style.display='none',4000);
+}
+
+document.getElementById('add-lead-modal').addEventListener('click',function(e){
+  if(e.target===this)closeAddLead();
+});
 
 loadStats();loadLeads();setInterval(()=>{loadStats();loadLeads();},30000);
 </script></body></html>"""
