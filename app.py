@@ -115,8 +115,12 @@ def send_delayed_reply(to_number: str, ai_reply: str, delay_seconds: int):
 
 # ─── DASHBOARD AUTH ───────────────────────────────────────────────────────────
 
-@app.route(f"/{SECRET_PATH}/login", methods=["GET", "POST"])
+@app.route("/login", methods=["GET", "POST"])
 def login():
+    # Secret token required — without ?t=TOKEN the page is invisible
+    if request.args.get("t") != SECRET_PATH:
+        return "<html><body></body></html>", 200
+
     ip    = request.remote_addr
     entry = failed_attempts.get(ip, {"count": 0, "locked_until": 0.0})
 
@@ -131,9 +135,9 @@ def login():
     error = ""
     if request.method == "POST":
         if request.form.get("password") == DASHBOARD_PASS:
-            failed_attempts.pop(ip, None)   # reset on success
+            failed_attempts.pop(ip, None)
             session["logged_in"] = True
-            return redirect(f"/{SECRET_PATH}/")
+            return redirect("/")
         else:
             entry["count"] = entry.get("count", 0) + 1
             if entry["count"] >= MAX_ATTEMPTS:
@@ -148,10 +152,10 @@ def login():
     return render_template_string(LOGIN_HTML, error=error)
 
 
-@app.route(f"/{SECRET_PATH}/logout")
+@app.route("/logout")
 def logout():
     session.clear()
-    return redirect(f"/{SECRET_PATH}/login")
+    return redirect(f"/login?t={SECRET_PATH}")
 
 
 def login_required(f):
@@ -159,7 +163,7 @@ def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if not session.get("logged_in"):
-            return redirect(f"/{SECRET_PATH}/login")
+            return redirect(f"/login?t={SECRET_PATH}")
         return f(*args, **kwargs)
     return decorated
 
@@ -167,15 +171,9 @@ def login_required(f):
 # ─── DASHBOARD ────────────────────────────────────────────────────────────────
 
 @app.route("/")
-def root():
-    """Blank root — hides the fact that a dashboard exists."""
-    return "<html><body></body></html>", 200
-
-
-@app.route(f"/{SECRET_PATH}/")
 @login_required
 def dashboard():
-    return render_template_string(DASHBOARD_HTML, secret_path=SECRET_PATH)
+    return render_template_string(DASHBOARD_HTML)
 
 
 # ─── API ROUTES ───────────────────────────────────────────────────────────────
@@ -411,6 +409,37 @@ def api_zapier():
     return jsonify({"status": "success", "message": f"Lead {first_name} added"})
 
 
+@app.route("/api/broadcast/selected", methods=["POST"])
+@login_required
+def api_broadcast_selected():
+    """Send a targeted message to a hand-picked list of leads."""
+    from sms_sender import send_sms
+    from lead_tracker import load_leads
+    data   = request.json or {}
+    phones  = data.get("phones", [])
+    message = data.get("message", "").strip()
+    if not phones or not message:
+        return jsonify({"error": "phones and message are required"}), 400
+    if len(phones) > 50:
+        return jsonify({"error": "Max 50 leads per targeted broadcast"}), 400
+
+    df = load_leads()
+
+    def _send():
+        for i, phone in enumerate(phones):
+            row = df[df["Phone (Formatted)"].astype(str).str.strip() == phone]
+            first_name = str(row.iloc[0]["First Name"]).strip() if not row.empty else ""
+            personalized = message.replace("{name}", first_name) if first_name else message
+            send_sms(phone, personalized)
+            if i < len(phones) - 1:
+                time.sleep(random.randint(10, 20))   # human-like gap
+
+    t = threading.Thread(target=_send)
+    t.daemon = True
+    t.start()
+    return jsonify({"status": "sending", "count": len(phones)})
+
+
 # ─── EXISTING ROUTES ──────────────────────────────────────────────────────────
 
 @app.route("/webhook/sms", methods=["POST"])
@@ -573,6 +602,17 @@ DASHBOARD_HTML = """
         .dot-red { background:#ef4444; }
         .dot-yellow { background:#f59e0b; animation: pulse 1.5s infinite; }
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+        .cb-col { width:36px; text-align:center; }
+        input[type=checkbox] { width:15px; height:15px; cursor:pointer; accent-color:#3b82f6; }
+        .sel-bar { position:fixed; bottom:28px; left:50%; transform:translateX(-50%); background:#1e40af; color:#fff; padding:12px 24px; border-radius:50px; display:none; align-items:center; gap:16px; box-shadow:0 4px 24px rgba(0,0,0,0.5); z-index:500; font-size:14px; white-space:nowrap; }
+        .sel-bar.show { display:flex; }
+        .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.65); z-index:600; display:none; align-items:center; justify-content:center; }
+        .modal-overlay.show { display:flex; }
+        .modal-box { background:#1e293b; border-radius:12px; padding:28px; width:480px; border:1px solid #334155; }
+        .modal-box h3 { color:#fff; margin-bottom:8px; font-size:16px; }
+        .modal-box p { color:#94a3b8; font-size:13px; margin-bottom:12px; }
+        .modal-box textarea { width:100%; height:100px; padding:10px; border-radius:8px; border:1px solid #334155; background:#0f172a; color:#fff; font-size:13px; resize:none; margin-bottom:14px; }
+        .modal-actions { display:flex; gap:10px; }
     </style>
 </head>
 <body>
@@ -585,7 +625,7 @@ DASHBOARD_HTML = """
     <div class="header-right">
         <button class="btn btn-green" onclick="triggerCampaign()">🚀 Launch Campaign</button>
         <button class="btn btn-yellow" id="pause-btn" onclick="togglePause()">⏸ Pause</button>
-        <button class="btn btn-gray" onclick="window.location='/{{ secret_path }}/logout'">Logout</button>
+        <button class="btn btn-gray" onclick="window.location='/logout'">Logout</button>
     </div>
 </div>
 
@@ -619,6 +659,7 @@ DASHBOARD_HTML = """
             <table>
                 <thead>
                     <tr>
+                        <th class="cb-col"><input type="checkbox" id="select-all" onchange="toggleSelectAll(this)" title="Select all visible"></th>
                         <th>Name</th>
                         <th>Phone</th>
                         <th>Type</th>
@@ -627,7 +668,7 @@ DASHBOARD_HTML = """
                     </tr>
                 </thead>
                 <tbody id="leads-tbody">
-                    <tr><td colspan="5" class="empty-state">Loading leads...</td></tr>
+                    <tr><td colspan="6" class="empty-state">Loading leads...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -665,12 +706,34 @@ DASHBOARD_HTML = """
     </div>
 </div>
 
+<!-- Selection action bar -->
+<div class="sel-bar" id="sel-bar">
+    <span id="sel-count">0 leads selected</span>
+    <button class="btn btn-green" onclick="openSelBroadcast()">📨 Send Message</button>
+    <button class="btn btn-gray" onclick="clearSelection()">✕ Clear</button>
+</div>
+
+<!-- Targeted broadcast modal -->
+<div class="modal-overlay" id="sel-modal">
+    <div class="modal-box">
+        <h3>📨 Send to Selected Leads</h3>
+        <p id="sel-modal-info" style="color:#60a5fa;font-weight:bold;"></p>
+        <p>Tip: type <strong>{name}</strong> and it auto-fills each lead's first name.</p>
+        <textarea id="sel-msg" placeholder="Hi {name}, just checking in — any update on your home search?"></textarea>
+        <div class="modal-actions">
+            <button class="btn btn-green" onclick="sendToSelected()" style="flex:1;">Send Now</button>
+            <button class="btn btn-gray" onclick="closeSelModal()" style="flex:1;">Cancel</button>
+        </div>
+    </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
 let currentFilter = 'all';
 let currentPhone = null;
 let searchTimer = null;
+let selectedLeads = new Set();  // tracks checked phone numbers
 
 async function loadStats() {
     const r = await fetch('/api/stats');
@@ -727,8 +790,14 @@ async function loadLeads() {
             'Cold': '<span class="badge badge-cold">❄️ Cold</span>',
         }[temp] || '';
 
-        const sel = currentPhone === phone ? 'selected' : '';
-        return `<tr class="${sel}" onclick="selectLead('${phone}','${name}')">
+        const sel     = currentPhone === phone ? 'selected' : '';
+        const checked = selectedLeads.has(phone) ? 'checked' : '';
+        const safePh  = phone.replace(/'/g, "\\'");
+        const safeNm  = name.replace(/'/g, "\\'");
+        return `<tr class="${sel}" onclick="selectLead('${safePh}','${safeNm}')">
+            <td class="cb-col" onclick="event.stopPropagation()">
+                <input type="checkbox" class="lead-cb" value="${phone}" ${checked} onchange="toggleCb(this)">
+            </td>
             <td>${name}</td>
             <td style="color:#94a3b8;font-size:12px;">${phone}</td>
             <td style="font-size:12px;">${type}</td>
@@ -736,6 +805,7 @@ async function loadLeads() {
             <td>${tempBadge}</td>
         </tr>`;
     }).join('');
+    refreshSelBar();
 }
 
 async function selectLead(phone, name) {
@@ -839,6 +909,75 @@ function showToast(msg, isError=false) {
     t.className = 'toast' + (isError ? ' error' : '');
     t.style.display = 'block';
     setTimeout(() => t.style.display = 'none', 4000);
+}
+
+// ── Checkbox / selection helpers ──────────────────────────────────────────────
+function toggleCb(cb) {
+    if (cb.checked) selectedLeads.add(cb.value);
+    else            selectedLeads.delete(cb.value);
+    refreshSelBar();
+    // update select-all state
+    const all = document.querySelectorAll('.lead-cb');
+    const sa  = document.getElementById('select-all');
+    if (sa) sa.checked = all.length > 0 && selectedLeads.size === all.length;
+}
+
+function toggleSelectAll(sa) {
+    document.querySelectorAll('.lead-cb').forEach(cb => {
+        cb.checked = sa.checked;
+        if (sa.checked) selectedLeads.add(cb.value);
+        else            selectedLeads.delete(cb.value);
+    });
+    refreshSelBar();
+}
+
+function clearSelection() {
+    selectedLeads.clear();
+    document.querySelectorAll('.lead-cb').forEach(cb => cb.checked = false);
+    const sa = document.getElementById('select-all');
+    if (sa) sa.checked = false;
+    refreshSelBar();
+}
+
+function refreshSelBar() {
+    const bar = document.getElementById('sel-bar');
+    const cnt = document.getElementById('sel-count');
+    if (selectedLeads.size > 0) {
+        bar.classList.add('show');
+        cnt.textContent = `${selectedLeads.size} lead${selectedLeads.size > 1 ? 's' : ''} selected`;
+    } else {
+        bar.classList.remove('show');
+    }
+}
+
+function openSelBroadcast() {
+    document.getElementById('sel-modal-info').textContent =
+        `Sending to ${selectedLeads.size} selected lead(s)`;
+    document.getElementById('sel-msg').value = '';
+    document.getElementById('sel-modal').classList.add('show');
+}
+
+function closeSelModal() {
+    document.getElementById('sel-modal').classList.remove('show');
+}
+
+async function sendToSelected() {
+    const message = document.getElementById('sel-msg').value.trim();
+    if (!message) { showToast('Please enter a message first', true); return; }
+    const phones = Array.from(selectedLeads);
+    const r = await fetch('/api/broadcast/selected', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({phones, message})
+    });
+    const d = await r.json();
+    if (d.error) {
+        showToast(d.error, true);
+    } else {
+        showToast(`✅ Sending to ${d.count} lead(s)...`);
+        closeSelModal();
+        clearSelection();
+    }
 }
 
 // Init
