@@ -16,8 +16,29 @@ import pandas as pd
 app = Flask(__name__)
 app.secret_key = os.environ.get("DASHBOARD_SECRET", "aman-royal-lepage-2024")
 
-# In-memory conversation store {phone: [{"role":..,"content":..}]}
-conversations = {}
+# Conversation store — persisted to volume so it survives redeploys
+import json
+
+CONV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads", "conversations.json")
+
+def load_conversations():
+    try:
+        if os.path.exists(CONV_FILE):
+            with open(CONV_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_conversations(convs):
+    try:
+        os.makedirs(os.path.dirname(CONV_FILE), exist_ok=True)
+        with open(CONV_FILE, "w") as f:
+            json.dump(convs, f)
+    except Exception as e:
+        print(f"[CONV] Could not save conversations: {e}")
+
+conversations = load_conversations()
 
 # Campaign pause state
 campaign_paused = False
@@ -281,6 +302,7 @@ def api_manual_reply():
     if phone not in conversations:
         conversations[phone] = []
     conversations[phone].append({"role": "assistant", "content": message})
+    save_conversations(conversations)
     success = send_sms(phone, message)
     return jsonify({"success": success})
 
@@ -530,7 +552,14 @@ def sms_webhook():
 
     temperature = classify_lead_temperature(incoming_msg)
     update_lead_reply(from_number, incoming_msg, temperature)
+
+    # Save lead's message to conversation history
+    conversations[from_number].append({"role": "user", "content": incoming_msg})
     ai_reply = generate_ai_reply(conversations[from_number], incoming_msg)
+
+    # Save AI reply to conversation history and persist to disk
+    conversations[from_number].append({"role": "assistant", "content": ai_reply})
+    save_conversations(conversations)
 
     words         = len(ai_reply.split())
     typing_delay  = random.randint(20, 45) + (words // 5)
