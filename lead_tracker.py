@@ -58,14 +58,17 @@ def init_db():
 
 def load_leads() -> pd.DataFrame:
     """Load all leads as a DataFrame with familiar column names."""
+    cols = [
+        'first_name', 'last_name', 'phone', 'email', 'buyer_seller', 'phase',
+        'city', 'pipeline_stage', 'source', 'notes', 'sms_status', 'sms_sent_at',
+        'sms_message_sent', 'reply_received', 'reply_text', 'lead_temperature',
+        'follow_up_required', 'agent_notes'
+    ]
     with get_conn() as conn:
-        df = pd.read_sql("""
-            SELECT first_name, last_name, phone, email, buyer_seller, phase,
-                   city, pipeline_stage, source, notes, sms_status, sms_sent_at,
-                   sms_message_sent, reply_received, reply_text, lead_temperature,
-                   follow_up_required, agent_notes
-            FROM leads ORDER BY id
-        """, conn)
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {', '.join(cols)} FROM leads ORDER BY id")
+            rows = cur.fetchall()
+    df = pd.DataFrame(rows, columns=cols)
     return df.rename(columns={
         'first_name': 'First Name',        'last_name': 'Last Name',
         'phone': 'Phone (Formatted)',       'email': 'Email',
