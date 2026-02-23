@@ -409,6 +409,54 @@ def api_zapier():
     return jsonify({"status": "success", "message": f"Lead {first_name} added"})
 
 
+@app.route("/api/add_lead", methods=["POST"])
+@login_required
+def api_add_lead():
+    from lead_tracker import load_leads, LEADS_FILE, SHEET_NAME
+    from openpyxl import load_workbook
+    data = request.json or {}
+
+    def fmt_phone(p):
+        if not p: return ""
+        n = str(p).strip().replace("-","").replace("(","").replace(")","").replace(" ","").replace("+","")
+        if len(n) == 10: return f"+1{n}"
+        elif len(n) == 11 and n.startswith("1"): return f"+{n}"
+        return f"+{n}"
+
+    first_name = str(data.get("first_name","")).strip()
+    phone      = fmt_phone(data.get("phone",""))
+
+    if not first_name or not phone:
+        return jsonify({"error": "First name and phone are required"}), 400
+
+    existing_df = load_leads()
+    if phone in existing_df["Phone (Formatted)"].astype(str).values:
+        return jsonify({"error": "This phone number already exists in your leads"}), 400
+
+    wb   = load_workbook(LEADS_FILE)
+    ws   = wb[SHEET_NAME]
+    hdrs = [cell.value for cell in ws[1]]
+
+    row_data = {
+        "First Name":        first_name,
+        "Last Name":         str(data.get("last_name","")),
+        "Phone (Formatted)": phone,
+        "Email":             str(data.get("email","")),
+        "Buyer/Seller":      str(data.get("buyer_seller","Buyer")),
+        "Phase":             str(data.get("phase","Phase 1")),
+        "Favorite City":     str(data.get("city","")),
+        "Notes":             str(data.get("notes","")),
+        "SMS Status":        "Pending",
+        "SMS Sent At": "", "SMS Message Sent": "",
+        "Reply Received": "No", "Reply Text": "",
+        "Lead Temperature": "", "Follow Up Required": "", "Agent Notes": ""
+    }
+
+    ws.append([row_data.get(h, "") for h in hdrs])
+    wb.save(LEADS_FILE)
+    return jsonify({"status": "success", "message": f"{first_name} added successfully!"})
+
+
 @app.route("/api/broadcast/selected", methods=["POST"])
 @login_required
 def api_broadcast_selected():
@@ -625,6 +673,7 @@ DASHBOARD_HTML = """
     <div class="header-right">
         <button class="btn btn-green" onclick="triggerCampaign()">🚀 Launch Campaign</button>
         <button class="btn btn-yellow" id="pause-btn" onclick="togglePause()">⏸ Pause</button>
+        <button class="btn btn-blue" onclick="openAddLead()">➕ Add Lead</button>
         <button class="btn btn-gray" onclick="window.location='/logout'">Logout</button>
     </div>
 </div>
@@ -723,6 +772,60 @@ DASHBOARD_HTML = """
         <div class="modal-actions">
             <button class="btn btn-green" onclick="sendToSelected()" style="flex:1;">Send Now</button>
             <button class="btn btn-gray" onclick="closeSelModal()" style="flex:1;">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<!-- Add Lead Modal -->
+<div class="modal-overlay" id="add-lead-modal">
+    <div class="modal-box" style="width:520px;">
+        <h3>➕ Add New Lead</h3>
+        <p>Fill in the details below to add a lead manually.</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
+            <div>
+                <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">First Name *</label>
+                <input type="text" id="al-fname" placeholder="John" style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#fff;font-size:13px;">
+            </div>
+            <div>
+                <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">Last Name</label>
+                <input type="text" id="al-lname" placeholder="Smith" style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#fff;font-size:13px;">
+            </div>
+            <div>
+                <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">Phone * (10 digits)</label>
+                <input type="text" id="al-phone" placeholder="4161234567" style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#fff;font-size:13px;">
+            </div>
+            <div>
+                <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">Email</label>
+                <input type="text" id="al-email" placeholder="john@email.com" style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#fff;font-size:13px;">
+            </div>
+            <div>
+                <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">Buyer or Seller</label>
+                <select id="al-type" style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#fff;font-size:13px;">
+                    <option value="Buyer">Buyer</option>
+                    <option value="Seller">Seller</option>
+                    <option value="Both">Both</option>
+                </select>
+            </div>
+            <div>
+                <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">Phase</label>
+                <select id="al-phase" style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#fff;font-size:13px;">
+                    <option value="Phase 1">Phase 1 (0-2 years)</option>
+                    <option value="Phase 2">Phase 2 (2-5 years)</option>
+                    <option value="Phase 3">Phase 3 (5+ years)</option>
+                </select>
+            </div>
+            <div style="grid-column:span 2;">
+                <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">City</label>
+                <input type="text" id="al-city" placeholder="Toronto" style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#fff;font-size:13px;">
+            </div>
+            <div style="grid-column:span 2;">
+                <label style="font-size:12px;color:#94a3b8;display:block;margin-bottom:4px;">Notes</label>
+                <input type="text" id="al-notes" placeholder="Any notes about this lead..." style="width:100%;padding:9px 12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#fff;font-size:13px;">
+            </div>
+        </div>
+        <div class="modal-actions">
+            <button class="btn btn-blue" onclick="submitAddLead()" style="flex:1;">Add Lead</button>
+            <button class="btn btn-gray" onclick="closeAddLead()" style="flex:1;">Cancel</button>
         </div>
     </div>
 </div>
@@ -909,6 +1012,46 @@ function showToast(msg, isError=false) {
     t.className = 'toast' + (isError ? ' error' : '');
     t.style.display = 'block';
     setTimeout(() => t.style.display = 'none', 4000);
+}
+
+// ── Add Lead ──────────────────────────────────────────────────────────────────
+function openAddLead() {
+    ['al-fname','al-lname','al-phone','al-email','al-city','al-notes'].forEach(id => {
+        document.getElementById(id).value = '';
+    });
+    document.getElementById('add-lead-modal').classList.add('show');
+}
+function closeAddLead() {
+    document.getElementById('add-lead-modal').classList.remove('show');
+}
+async function submitAddLead() {
+    const fname = document.getElementById('al-fname').value.trim();
+    const phone = document.getElementById('al-phone').value.trim();
+    if (!fname || !phone) { showToast('First name and phone are required', true); return; }
+    const payload = {
+        first_name:  fname,
+        last_name:   document.getElementById('al-lname').value.trim(),
+        phone:       phone,
+        email:       document.getElementById('al-email').value.trim(),
+        buyer_seller:document.getElementById('al-type').value,
+        phase:       document.getElementById('al-phase').value,
+        city:        document.getElementById('al-city').value.trim(),
+        notes:       document.getElementById('al-notes').value.trim()
+    };
+    const r = await fetch('/api/add_lead', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    if (d.error) {
+        showToast(d.error, true);
+    } else {
+        showToast(`✅ ${d.message}`);
+        closeAddLead();
+        loadStats();
+        loadLeads();
+    }
 }
 
 // ── Checkbox / selection helpers ──────────────────────────────────────────────
