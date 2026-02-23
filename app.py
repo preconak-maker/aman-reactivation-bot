@@ -40,6 +40,27 @@ def save_conversations(convs):
 
 conversations = load_conversations()
 
+# ── In-memory leads cache (avoids re-reading Excel on every request) ──────────
+_leads_cache = {"df": None, "mtime": 0.0}
+
+def get_leads_df():
+    """Return cached DataFrame, reload only if file changed on disk."""
+    from lead_tracker import LEADS_FILE
+    try:
+        mtime = os.path.getmtime(LEADS_FILE)
+        if _leads_cache["df"] is None or _leads_cache["mtime"] != mtime:
+            from lead_tracker import load_leads
+            _leads_cache["df"]    = load_leads()
+            _leads_cache["mtime"] = mtime
+        return _leads_cache["df"].copy()
+    except Exception:
+        return _leads_cache["df"].copy() if _leads_cache["df"] is not None else pd.DataFrame()
+
+def bust_cache():
+    """Call after any write to the leads file."""
+    _leads_cache["df"]    = None
+    _leads_cache["mtime"] = 0.0
+
 # Campaign pause state
 campaign_paused = False
 
@@ -202,9 +223,8 @@ def dashboard():
 @app.route("/api/stats")
 @login_required
 def api_stats():
-    from lead_tracker import load_leads, LEADS_FILE
     try:
-        df = load_leads()
+        df = get_leads_df()
         total      = len(df)
         sent       = len(df[df["SMS Status"] == "Sent"])
         pending    = len(df[df["SMS Status"] == "Pending"])
@@ -224,9 +244,8 @@ def api_stats():
 @app.route("/api/leads")
 @login_required
 def api_leads():
-    from lead_tracker import load_leads
     try:
-        df = load_leads()
+        df = get_leads_df()
         search = request.args.get("search", "").lower()
         filter_temp = request.args.get("filter", "all")
 
@@ -329,6 +348,7 @@ def api_upload_leads():
                 os.makedirs(os.path.dirname(LEADS_FILE), exist_ok=True)
                 with open(LEADS_FILE, "wb") as f:
                     f.write(file_bytes)
+                bust_cache()
                 count = len(pd.read_excel(io.BytesIO(file_bytes), sheet_name=SHEET_NAME))
                 return jsonify({"added": count, "message": f"✅ {count} leads loaded successfully!"})
         except Exception:
@@ -388,6 +408,7 @@ def api_upload_leads():
             ws.append(new_row)
 
         wb.save(LEADS_FILE)
+        bust_cache()
         return jsonify({"added": len(new_df), "message": f"{len(new_df)} new leads added successfully!"})
 
     except Exception as e:
@@ -495,6 +516,7 @@ def api_add_lead():
 
     ws.append([row_data.get(h, "") for h in hdrs])
     wb.save(LEADS_FILE)
+    bust_cache()
     return jsonify({"status": "success", "message": f"{first_name} added successfully!"})
 
 
@@ -1171,10 +1193,10 @@ async function sendToSelected() {
     }
 }
 
-// Init
-loadStats();
-loadLeads();
-setInterval(() => { loadStats(); loadLeads(); }, 30000);
+// Init — load in parallel for speed
+function refreshAll() { Promise.all([loadStats(), loadLeads()]); }
+refreshAll();
+setInterval(refreshAll, 30000);
 </script>
 </body>
 </html>
