@@ -229,12 +229,13 @@ def api_leads():
             df = df[df["Reply Received"] == "Yes"]
 
         df = df.fillna("")
-        leads = df[[
-            "First Name", "Last Name", "Phone (Formatted)",
-            "Buyer/Seller", "SMS Status", "SMS Sent At",
-            "Reply Received", "Reply Text", "Lead Temperature",
-            "Favorite City", "Pipeline Stage"
-        ]].to_dict(orient="records")
+        # Only select columns that actually exist in the file
+        want = ["First Name", "Last Name", "Phone (Formatted)",
+                "Buyer/Seller", "SMS Status", "SMS Sent At",
+                "Reply Received", "Reply Text", "Lead Temperature",
+                "Favorite City", "Pipeline Stage"]
+        cols = [c for c in want if c in df.columns]
+        leads = df[cols].to_dict(orient="records")
 
         return jsonify({"leads": leads, "total": len(leads)})
     except Exception as e:
