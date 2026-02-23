@@ -1,6 +1,7 @@
 """
 Aman's Team — Reactivation SMS Agent
 Flask app with scheduler + Twilio webhook + Dashboard
+PostgreSQL-backed via Railway (DATABASE_URL auto-injected).
 """
 
 from flask import Flask, request, jsonify, render_template_string, session, redirect
@@ -16,50 +17,22 @@ import pandas as pd
 app = Flask(__name__)
 app.secret_key = os.environ.get("DASHBOARD_SECRET", "aman-royal-lepage-2024")
 
-# Conversation store — persisted to volume so it survives redeploys
-import json
+# ── In-memory leads cache (15-second TTL — avoids hitting DB on every request) ─
+_cache = {"df": None, "ts": 0.0}
+CACHE_TTL = 15  # seconds
 
-CONV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads", "conversations.json")
-
-def load_conversations():
-    try:
-        if os.path.exists(CONV_FILE):
-            with open(CONV_FILE, "r") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-def save_conversations(convs):
-    try:
-        os.makedirs(os.path.dirname(CONV_FILE), exist_ok=True)
-        with open(CONV_FILE, "w") as f:
-            json.dump(convs, f)
-    except Exception as e:
-        print(f"[CONV] Could not save conversations: {e}")
-
-conversations = load_conversations()
-
-# ── In-memory leads cache (avoids re-reading Excel on every request) ──────────
-_leads_cache = {"df": None, "mtime": 0.0}
-
-def get_leads_df():
-    """Return cached DataFrame, reload only if file changed on disk."""
-    from lead_tracker import LEADS_FILE
-    try:
-        mtime = os.path.getmtime(LEADS_FILE)
-        if _leads_cache["df"] is None or _leads_cache["mtime"] != mtime:
-            from lead_tracker import load_leads
-            _leads_cache["df"]    = load_leads()
-            _leads_cache["mtime"] = mtime
-        return _leads_cache["df"].copy()
-    except Exception:
-        return _leads_cache["df"].copy() if _leads_cache["df"] is not None else pd.DataFrame()
+def get_leads_df() -> pd.DataFrame:
+    """Return cached DataFrame; reload from DB after TTL expires."""
+    if _cache["df"] is None or (time.time() - _cache["ts"]) > CACHE_TTL:
+        from lead_tracker import load_leads
+        _cache["df"] = load_leads()
+        _cache["ts"] = time.time()
+    return _cache["df"].copy()
 
 def bust_cache():
-    """Call after any write to the leads file."""
-    _leads_cache["df"]    = None
-    _leads_cache["mtime"] = 0.0
+    """Call after any write so the next request reloads from DB."""
+    _cache["df"] = None
+    _cache["ts"] = 0.0
 
 # Campaign pause state
 campaign_paused = False
@@ -112,6 +85,7 @@ def run_daily_campaign():
         message = get_followup_message(str(lead["First Name"]).strip())
         if send_sms(phone, message):
             update_lead_sent(phone, message)
+            bust_cache()
             sent_count += 1
             if sent_count < DAILY_LIMIT:
                 human_delay()
@@ -126,6 +100,7 @@ def run_daily_campaign():
         message      = get_initial_message(first_name, buyer_seller, fav_city)
         if send_sms(phone, message):
             update_lead_sent(phone, message)
+            bust_cache()
             sent_count += 1
             if sent_count < DAILY_LIMIT:
                 human_delay()
@@ -159,14 +134,12 @@ def send_delayed_reply(to_number: str, ai_reply: str, delay_seconds: int):
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    # Secret token required — without ?t=TOKEN the page is invisible
     if request.args.get("t") != SECRET_PATH:
         return "<html><body></body></html>", 200
 
     ip    = request.remote_addr
     entry = failed_attempts.get(ip, {"count": 0, "locked_until": 0.0})
 
-    # Check if locked out
     if entry["locked_until"] > time.time():
         mins_left = int((entry["locked_until"] - time.time()) / 60) + 1
         return render_template_string(
@@ -269,10 +242,8 @@ def api_leads():
             df = df[df["Reply Received"] == "Yes"]
 
         df = df.fillna("")
-        # Force all columns to string to avoid JSON type errors
         for col in df.columns:
             df[col] = df[col].astype(str).str.strip().replace("nan", "")
-        # Only select columns that actually exist in the file
         want = ["First Name", "Last Name", "Phone (Formatted)",
                 "Buyer/Seller", "SMS Status", "SMS Sent At",
                 "Reply Received", "Reply Text", "Lead Temperature",
@@ -288,12 +259,13 @@ def api_leads():
 @app.route("/api/conversation/<path:phone>")
 @login_required
 def api_conversation(phone):
-    history = conversations.get(phone, [])
-    from lead_tracker import load_leads
+    from lead_tracker import get_conversation
+    phone = phone.strip()
+    history = get_conversation(phone)
     try:
-        df = load_leads()
+        df = get_leads_df()
         df["Phone (Formatted)"] = df["Phone (Formatted)"].astype(str).str.strip()
-        lead_row = df[df["Phone (Formatted)"] == phone.strip()]
+        lead_row = df[df["Phone (Formatted)"] == phone]
         initial_msg = ""
         reply_text  = ""
         if not lead_row.empty:
@@ -312,16 +284,13 @@ def api_conversation(phone):
 @login_required
 def api_manual_reply():
     from sms_sender import send_sms
-    from lead_tracker import update_lead_reply
+    from lead_tracker import save_message
     data    = request.json
     phone   = data.get("phone", "")
     message = data.get("message", "")
     if not phone or not message:
         return jsonify({"error": "Phone and message required"}), 400
-    if phone not in conversations:
-        conversations[phone] = []
-    conversations[phone].append({"role": "assistant", "content": message})
-    save_conversations(conversations)
+    save_message(phone, "assistant", message)
     success = send_sms(phone, message)
     return jsonify({"success": success})
 
@@ -329,9 +298,8 @@ def api_manual_reply():
 @app.route("/api/upload", methods=["POST"])
 @login_required
 def api_upload_leads():
-    from lead_tracker import load_leads, LEADS_FILE, SHEET_NAME
-    from openpyxl import load_workbook
-    import io, shutil
+    from lead_tracker import add_lead
+    import io
 
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
@@ -340,33 +308,22 @@ def api_upload_leads():
     try:
         file_bytes = file.read()
 
-        # If uploaded file already has the right sheet, save it directly
         try:
-            from openpyxl import load_workbook as lw
-            wb_check = lw(io.BytesIO(file_bytes))
-            if SHEET_NAME in wb_check.sheetnames:
-                os.makedirs(os.path.dirname(LEADS_FILE), exist_ok=True)
-                with open(LEADS_FILE, "wb") as f:
-                    f.write(file_bytes)
-                bust_cache()
-                count = len(pd.read_excel(io.BytesIO(file_bytes), sheet_name=SHEET_NAME))
-                return jsonify({"added": count, "message": f"✅ {count} leads loaded successfully!"})
+            new_df = pd.read_excel(io.BytesIO(file_bytes))
         except Exception:
-            pass  # fall through to merge logic
+            new_df = pd.read_csv(io.BytesIO(file_bytes))
 
-        new_df = pd.read_excel(io.BytesIO(file_bytes))
-
-        # Normalize column names
         col_map = {
             "first name": "First Name", "last name": "Last Name",
             "phone": "Phone (Formatted)", "cell phone": "Phone (Formatted)",
             "email": "Email", "email address": "Email",
             "buyer/seller": "Buyer/Seller", "city": "Favorite City",
-            "notes": "Notes"
+            "favorite city": "Favorite City",
+            "notes": "Notes", "phase": "Phase",
+            "pipeline stage": "Pipeline Stage", "source": "Source"
         }
         new_df.columns = [col_map.get(c.lower().strip(), c) for c in new_df.columns]
 
-        # Format phone numbers
         def fmt_phone(p):
             if pd.isna(p): return ""
             n = str(p).strip().replace("-","").replace("(","").replace(")","").replace(" ","").replace("+","")
@@ -377,39 +334,27 @@ def api_upload_leads():
         if "Phone (Formatted)" in new_df.columns:
             new_df["Phone (Formatted)"] = new_df["Phone (Formatted)"].apply(fmt_phone)
 
-        # Load existing leads and deduplicate
-        existing_df = load_leads()
-        existing_phones = set(existing_df["Phone (Formatted)"].astype(str).str.strip())
-        new_df = new_df[~new_df["Phone (Formatted)"].isin(existing_phones)]
-
-        if new_df.empty:
-            return jsonify({"added": 0, "message": "No new leads — all duplicates"})
-
-        # Add tracking columns
-        new_df["SMS Status"]          = "Pending"
-        new_df["SMS Sent At"]         = ""
-        new_df["SMS Message Sent"]    = ""
-        new_df["Reply Received"]      = "No"
-        new_df["Reply Text"]          = ""
-        new_df["Lead Temperature"]    = ""
-        new_df["Follow Up Required"]  = ""
-        new_df["Agent Notes"]         = ""
-
-        # Append to Excel
-        wb = load_workbook(LEADS_FILE)
-        ws = wb[SHEET_NAME]
-        headers = [cell.value for cell in ws[1]]
-
+        added = 0
         for _, row in new_df.iterrows():
-            new_row = []
-            for h in headers:
-                val = row.get(h, "")
-                new_row.append("" if pd.isna(val) else val)
-            ws.append(new_row)
+            phone = str(row.get("Phone (Formatted)", "") or "").strip()
+            if not phone or phone.lower() == "nan":
+                continue
+            if add_lead({
+                'first_name':   str(row.get("First Name",    "") or ""),
+                'last_name':    str(row.get("Last Name",     "") or ""),
+                'phone':        phone,
+                'email':        str(row.get("Email",         "") or ""),
+                'buyer_seller': str(row.get("Buyer/Seller",  "") or "Buyer"),
+                'phase':        str(row.get("Phase",         "") or "Phase 1"),
+                'city':         str(row.get("Favorite City", "") or ""),
+                'notes':        str(row.get("Notes",         "") or ""),
+            }):
+                added += 1
 
-        wb.save(LEADS_FILE)
         bust_cache()
-        return jsonify({"added": len(new_df), "message": f"{len(new_df)} new leads added successfully!"})
+        if added == 0:
+            return jsonify({"added": 0, "message": "No new leads — all duplicates"})
+        return jsonify({"added": added, "message": f"✅ {added} new leads added successfully!"})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -426,10 +371,8 @@ def api_pause():
 
 @app.route("/api/zapier", methods=["POST"])
 def api_zapier():
-    """Zapier webhook endpoint — receives new leads from Meta Lead Ads."""
+    from lead_tracker import add_lead
     data = request.json or request.form.to_dict()
-    from lead_tracker import load_leads, LEADS_FILE, SHEET_NAME
-    from openpyxl import load_workbook
 
     def fmt_phone(p):
         if not p: return ""
@@ -438,44 +381,33 @@ def api_zapier():
         elif len(n) == 11 and n.startswith("1"): return f"+{n}"
         return f"+{n}"
 
-    phone = fmt_phone(data.get("phone") or data.get("cell_phone") or data.get("phone_number",""))
+    phone      = fmt_phone(data.get("phone") or data.get("cell_phone") or data.get("phone_number",""))
     first_name = str(data.get("first_name") or data.get("name","")).strip()
 
     if not phone or not first_name:
         return jsonify({"error": "first_name and phone are required"}), 400
 
-    existing_df = load_leads()
-    if phone in existing_df["Phone (Formatted)"].astype(str).values:
+    added = add_lead({
+        'first_name':   first_name,
+        'last_name':    str(data.get("last_name","")),
+        'phone':        phone,
+        'email':        str(data.get("email","")),
+        'buyer_seller': str(data.get("buyer_seller","Buyer")),
+        'city':         str(data.get("city","")),
+        'notes':        str(data.get("notes") or data.get("ad_notes","")),
+    })
+
+    if not added:
         return jsonify({"status": "duplicate", "message": "Lead already exists"})
 
-    wb   = load_workbook(LEADS_FILE)
-    ws   = wb[SHEET_NAME]
-    hdrs = [cell.value for cell in ws[1]]
-
-    row_data = {
-        "First Name": first_name,
-        "Last Name": str(data.get("last_name","")),
-        "Phone (Formatted)": phone,
-        "Email": str(data.get("email","")),
-        "Buyer/Seller": str(data.get("buyer_seller","Buyer")),
-        "Favorite City": str(data.get("city","")),
-        "Notes": str(data.get("notes") or data.get("ad_notes","")),
-        "SMS Status": "Pending",
-        "SMS Sent At": "", "SMS Message Sent": "",
-        "Reply Received": "No", "Reply Text": "",
-        "Lead Temperature": "", "Follow Up Required": "", "Agent Notes": ""
-    }
-
-    ws.append([row_data.get(h, "") for h in hdrs])
-    wb.save(LEADS_FILE)
+    bust_cache()
     return jsonify({"status": "success", "message": f"Lead {first_name} added"})
 
 
 @app.route("/api/add_lead", methods=["POST"])
 @login_required
 def api_add_lead():
-    from lead_tracker import load_leads, LEADS_FILE, SHEET_NAME
-    from openpyxl import load_workbook
+    from lead_tracker import add_lead
     data = request.json or {}
 
     def fmt_phone(p):
@@ -491,31 +423,20 @@ def api_add_lead():
     if not first_name or not phone:
         return jsonify({"error": "First name and phone are required"}), 400
 
-    existing_df = load_leads()
-    if phone in existing_df["Phone (Formatted)"].astype(str).values:
+    added = add_lead({
+        'first_name':   first_name,
+        'last_name':    str(data.get("last_name","")),
+        'phone':        phone,
+        'email':        str(data.get("email","")),
+        'buyer_seller': str(data.get("buyer_seller","Buyer")),
+        'phase':        str(data.get("phase","Phase 1")),
+        'city':         str(data.get("city","")),
+        'notes':        str(data.get("notes","")),
+    })
+
+    if not added:
         return jsonify({"error": "This phone number already exists in your leads"}), 400
 
-    wb   = load_workbook(LEADS_FILE)
-    ws   = wb[SHEET_NAME]
-    hdrs = [cell.value for cell in ws[1]]
-
-    row_data = {
-        "First Name":        first_name,
-        "Last Name":         str(data.get("last_name","")),
-        "Phone (Formatted)": phone,
-        "Email":             str(data.get("email","")),
-        "Buyer/Seller":      str(data.get("buyer_seller","Buyer")),
-        "Phase":             str(data.get("phase","Phase 1")),
-        "Favorite City":     str(data.get("city","")),
-        "Notes":             str(data.get("notes","")),
-        "SMS Status":        "Pending",
-        "SMS Sent At": "", "SMS Message Sent": "",
-        "Reply Received": "No", "Reply Text": "",
-        "Lead Temperature": "", "Follow Up Required": "", "Agent Notes": ""
-    }
-
-    ws.append([row_data.get(h, "") for h in hdrs])
-    wb.save(LEADS_FILE)
     bust_cache()
     return jsonify({"status": "success", "message": f"{first_name} added successfully!"})
 
@@ -523,10 +444,8 @@ def api_add_lead():
 @app.route("/api/broadcast/selected", methods=["POST"])
 @login_required
 def api_broadcast_selected():
-    """Send a targeted message to a hand-picked list of leads."""
     from sms_sender import send_sms
-    from lead_tracker import load_leads
-    data   = request.json or {}
+    data    = request.json or {}
     phones  = data.get("phones", [])
     message = data.get("message", "").strip()
     if not phones or not message:
@@ -534,7 +453,7 @@ def api_broadcast_selected():
     if len(phones) > 50:
         return jsonify({"error": "Max 50 leads per targeted broadcast"}), 400
 
-    df = load_leads()
+    df = get_leads_df()
 
     def _send():
         for i, phone in enumerate(phones):
@@ -543,7 +462,7 @@ def api_broadcast_selected():
             personalized = message.replace("{name}", first_name) if first_name else message
             send_sms(phone, personalized)
             if i < len(phones) - 1:
-                time.sleep(random.randint(10, 20))   # human-like gap
+                time.sleep(random.randint(10, 20))
 
     t = threading.Thread(target=_send)
     t.daemon = True
@@ -551,11 +470,11 @@ def api_broadcast_selected():
     return jsonify({"status": "sending", "count": len(phones)})
 
 
-# ─── EXISTING ROUTES ──────────────────────────────────────────────────────────
+# ─── WEBHOOK ──────────────────────────────────────────────────────────────────
 
 @app.route("/webhook/sms", methods=["POST"])
 def sms_webhook():
-    from lead_tracker import update_lead_reply, update_lead_optout
+    from lead_tracker import update_lead_reply, update_lead_optout, get_conversation, save_message
     from sms_sender import generate_ai_reply, classify_lead_temperature
 
     incoming_msg = request.form.get("Body", "").strip()
@@ -566,25 +485,21 @@ def sms_webhook():
 
     if incoming_msg.upper() in ["STOP", "UNSUBSCRIBE", "CANCEL", "QUIT", "END"]:
         update_lead_optout(from_number)
+        bust_cache()
         resp.message("You've been unsubscribed. You won't receive any more messages from us. Take care!")
         return str(resp)
 
-    if from_number not in conversations:
-        conversations[from_number] = []
-
     temperature = classify_lead_temperature(incoming_msg)
     update_lead_reply(from_number, incoming_msg, temperature)
+    bust_cache()
 
-    # Save lead's message to conversation history
-    conversations[from_number].append({"role": "user", "content": incoming_msg})
-    ai_reply = generate_ai_reply(conversations[from_number], incoming_msg)
+    history  = get_conversation(from_number)
+    ai_reply = generate_ai_reply(history, incoming_msg)
+    save_message(from_number, "user", incoming_msg)
+    save_message(from_number, "assistant", ai_reply)
 
-    # Save AI reply to conversation history and persist to disk
-    conversations[from_number].append({"role": "assistant", "content": ai_reply})
-    save_conversations(conversations)
-
-    words         = len(ai_reply.split())
-    typing_delay  = random.randint(20, 45) + (words // 5)
+    words        = len(ai_reply.split())
+    typing_delay = random.randint(20, 45) + (words // 5)
 
     reply_thread = threading.Thread(
         target=send_delayed_reply,
@@ -758,7 +673,6 @@ DASHBOARD_HTML = """
 </div>
 
 <div class="main">
-    <!-- LEFT: Leads Table -->
     <div class="panel">
         <div class="panel-header">
             <h3>All Leads</h3>
@@ -793,10 +707,7 @@ DASHBOARD_HTML = """
         </div>
     </div>
 
-    <!-- RIGHT: Conversation + Upload -->
     <div style="display:flex;flex-direction:column;gap:16px;">
-
-        <!-- Conversation Panel -->
         <div class="panel conv-panel" style="flex:1;">
             <div class="panel-header">
                 <h3 id="conv-title">Select a lead to view conversation</h3>
@@ -810,7 +721,6 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
-        <!-- Upload New Leads -->
         <div class="panel">
             <div class="panel-header"><h3>📁 Upload New Leads</h3></div>
             <div class="upload-area">
@@ -821,18 +731,15 @@ DASHBOARD_HTML = """
                 <input type="file" id="file-upload" accept=".xlsx,.csv" onchange="uploadLeads(this)">
             </div>
         </div>
-
     </div>
 </div>
 
-<!-- Selection action bar -->
 <div class="sel-bar" id="sel-bar">
     <span id="sel-count">0 leads selected</span>
     <button class="btn btn-green" onclick="openSelBroadcast()">📨 Send Message</button>
     <button class="btn btn-gray" onclick="clearSelection()">✕ Clear</button>
 </div>
 
-<!-- Targeted broadcast modal -->
 <div class="modal-overlay" id="sel-modal">
     <div class="modal-box">
         <h3>📨 Send to Selected Leads</h3>
@@ -846,7 +753,6 @@ DASHBOARD_HTML = """
     </div>
 </div>
 
-<!-- Add Lead Modal -->
 <div class="modal-overlay" id="add-lead-modal">
     <div class="modal-box" style="width:520px;">
         <h3>➕ Add New Lead</h3>
@@ -906,7 +812,7 @@ DASHBOARD_HTML = """
 let currentFilter = 'all';
 let currentPhone = null;
 let searchTimer = null;
-let selectedLeads = new Set();  // tracks checked phone numbers
+let selectedLeads = new Set();
 
 async function loadStats() {
     const r = await fetch('/api/stats');
@@ -1034,7 +940,6 @@ async function sendManualReply() {
 async function triggerCampaign() {
     if (!confirm('Launch campaign now? This will start sending SMS to pending leads.')) return;
     const r = await fetch('/trigger');
-    const d = await r.json();
     showToast('🚀 Campaign launched! Messages sending now...');
     setTimeout(loadStats, 3000);
 }
@@ -1084,7 +989,6 @@ function showToast(msg, isError=false) {
     setTimeout(() => t.style.display = 'none', 4000);
 }
 
-// ── Add Lead ──────────────────────────────────────────────────────────────────
 function openAddLead() {
     ['al-fname','al-lname','al-phone','al-email','al-city','al-notes'].forEach(id => {
         document.getElementById(id).value = '';
@@ -1124,12 +1028,10 @@ async function submitAddLead() {
     }
 }
 
-// ── Checkbox / selection helpers ──────────────────────────────────────────────
 function toggleCb(cb) {
     if (cb.checked) selectedLeads.add(cb.value);
     else            selectedLeads.delete(cb.value);
     refreshSelBar();
-    // update select-all state
     const all = document.querySelectorAll('.lead-cb');
     const sa  = document.getElementById('select-all');
     if (sa) sa.checked = all.length > 0 && selectedLeads.size === all.length;
@@ -1193,7 +1095,6 @@ async function sendToSelected() {
     }
 }
 
-// Init — load in parallel for speed
 function refreshAll() { Promise.all([loadStats(), loadLeads()]); }
 refreshAll();
 setInterval(refreshAll, 30000);
@@ -1202,30 +1103,10 @@ setInterval(refreshAll, 30000);
 </html>
 """
 
-def ensure_leads_file():
-    """Create a blank leads file with correct headers if it doesn't exist.
-    Runs on every startup so Railway volume is always ready."""
-    from openpyxl import Workbook
-    leads_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads")
-    leads_file = os.path.join(leads_dir, "Aman_Pilot_Leads_179.xlsx")
-    os.makedirs(leads_dir, exist_ok=True)
-    if not os.path.exists(leads_file):
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Pilot Leads (179)"
-        ws.append([
-            "First Name", "Last Name", "Phone (Formatted)", "Email",
-            "Buyer/Seller", "Phase", "Favorite City", "Pipeline Stage",
-            "Source", "Notes", "SMS Status", "SMS Sent At",
-            "SMS Message Sent", "Reply Received", "Reply Text",
-            "Lead Temperature", "Follow Up Required", "Agent Notes"
-        ])
-        wb.save(leads_file)
-        print(f"[SETUP] Created blank leads file at {leads_file}")
-    else:
-        print(f"[SETUP] Leads file found: {leads_file}")
-
-ensure_leads_file()
+# ─── STARTUP ──────────────────────────────────────────────────────────────────
+from lead_tracker import init_db, migrate_from_excel
+init_db()
+migrate_from_excel()
 
 # Start background scheduler thread
 scheduler_thread = threading.Thread(target=scheduler_loop)
