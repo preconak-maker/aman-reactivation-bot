@@ -286,14 +286,29 @@ def api_manual_reply():
 def api_upload_leads():
     from lead_tracker import load_leads, LEADS_FILE, SHEET_NAME
     from openpyxl import load_workbook
-    import io
+    import io, shutil
 
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
 
     file = request.files["file"]
     try:
-        new_df = pd.read_excel(io.BytesIO(file.read()))
+        file_bytes = file.read()
+
+        # If uploaded file already has the right sheet, save it directly
+        try:
+            from openpyxl import load_workbook as lw
+            wb_check = lw(io.BytesIO(file_bytes))
+            if SHEET_NAME in wb_check.sheetnames:
+                os.makedirs(os.path.dirname(LEADS_FILE), exist_ok=True)
+                with open(LEADS_FILE, "wb") as f:
+                    f.write(file_bytes)
+                count = len(pd.read_excel(io.BytesIO(file_bytes), sheet_name=SHEET_NAME))
+                return jsonify({"added": count, "message": f"✅ {count} leads loaded successfully!"})
+        except Exception:
+            pass  # fall through to merge logic
+
+        new_df = pd.read_excel(io.BytesIO(file_bytes))
 
         # Normalize column names
         col_map = {
@@ -1131,6 +1146,31 @@ setInterval(() => { loadStats(); loadLeads(); }, 30000);
 </body>
 </html>
 """
+
+def ensure_leads_file():
+    """Create a blank leads file with correct headers if it doesn't exist.
+    Runs on every startup so Railway volume is always ready."""
+    from openpyxl import Workbook
+    leads_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads")
+    leads_file = os.path.join(leads_dir, "Aman_Pilot_Leads_179.xlsx")
+    os.makedirs(leads_dir, exist_ok=True)
+    if not os.path.exists(leads_file):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Pilot Leads (179)"
+        ws.append([
+            "First Name", "Last Name", "Phone (Formatted)", "Email",
+            "Buyer/Seller", "Phase", "Favorite City", "Pipeline Stage",
+            "Source", "Notes", "SMS Status", "SMS Sent At",
+            "SMS Message Sent", "Reply Received", "Reply Text",
+            "Lead Temperature", "Follow Up Required", "Agent Notes"
+        ])
+        wb.save(leads_file)
+        print(f"[SETUP] Created blank leads file at {leads_file}")
+    else:
+        print(f"[SETUP] Leads file found: {leads_file}")
+
+ensure_leads_file()
 
 # Start background scheduler thread
 scheduler_thread = threading.Thread(target=scheduler_loop)
