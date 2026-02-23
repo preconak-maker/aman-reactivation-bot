@@ -229,6 +229,9 @@ def api_leads():
             df = df[df["Reply Received"] == "Yes"]
 
         df = df.fillna("")
+        # Force all columns to string to avoid JSON type errors
+        for col in df.columns:
+            df[col] = df[col].astype(str).str.strip().replace("nan", "")
         # Only select columns that actually exist in the file
         want = ["First Name", "Last Name", "Phone (Formatted)",
                 "Buyer/Seller", "SMS Status", "SMS Sent At",
@@ -911,8 +914,8 @@ async function loadLeads() {
 
         const sel     = currentPhone === phone ? 'selected' : '';
         const checked = selectedLeads.has(phone) ? 'checked' : '';
-        const safePh  = phone.replace(/'/g, "\\'");
-        const safeNm  = name.replace(/'/g, "\\'");
+        const safePh  = String(phone).replace(/'/g, "\\'");
+        const safeNm  = String(name).replace(/'/g, "\\'");
         return `<tr class="${sel}" onclick="selectLead('${safePh}','${safeNm}')">
             <td class="cb-col" onclick="event.stopPropagation()">
                 <input type="checkbox" class="lead-cb" value="${phone}" ${checked} onchange="toggleCb(this)">
