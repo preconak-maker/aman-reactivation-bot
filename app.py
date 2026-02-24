@@ -456,13 +456,16 @@ def api_broadcast_selected():
     df = get_leads_df()
 
     def _send():
-        for i, phone in enumerate(phones):
-            row = df[df["Phone (Formatted)"].astype(str).str.strip() == phone]
-            first_name = str(row.iloc[0]["First Name"]).strip() if not row.empty else ""
-            personalized = message.replace("{name}", first_name) if first_name else message
-            send_sms(phone, personalized)
-            if i < len(phones) - 1:
-                time.sleep(random.randint(10, 20))
+    from lead_tracker import save_message, update_lead_sent
+    for i, phone in enumerate(phones):
+        row = df[df["Phone (Formatted)"].astype(str).str.strip() == phone]
+        first_name = str(row.iloc[0]["First Name"]).strip() if not row.empty else ""
+        personalized = message.replace("{name}", first_name) if first_name else message
+        if send_sms(phone, personalized):
+            save_message(phone, "assistant", personalized)
+            update_lead_sent(phone, personalized)
+        if i < len(phones) - 1:
+            time.sleep(random.randint(10, 20))
 
     t = threading.Thread(target=_send)
     t.daemon = True
